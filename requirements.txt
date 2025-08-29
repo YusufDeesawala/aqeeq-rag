@@ -4,3 +4,4 @@ sentence-transformers
 numpy 
 requests 
 python-dotenv
+gunicorn
