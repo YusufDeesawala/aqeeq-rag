@@ -1,0 +1,6 @@
+flask 
+faiss-cpu 
+sentence-transformers 
+numpy 
+requests 
+sqlite3
