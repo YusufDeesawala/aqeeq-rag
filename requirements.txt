@@ -3,4 +3,4 @@ faiss-cpu
 sentence-transformers 
 numpy 
 requests 
-sqlite3
+python-dotenv
