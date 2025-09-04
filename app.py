@@ -7,7 +7,6 @@ import numpy as np
 import faiss
 import requests
 from flask import Flask, request, jsonify
-from sentence_transformers import SentenceTransformer
 from sklearn.decomposition import PCA
 
 # ---------- CONFIG ----------
@@ -21,15 +20,13 @@ META_PATH = os.path.join(DATA_DIR, "meta.json")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_REST_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+GEMINI_EMBED_MODEL = "embedding-001"
 
-EMBED_DIM = 384         # MiniLM output
-REDUCED_DIM = 64        # target dim
+REDUCED_DIM = 64        # target dim if PCA is used
 PCA_THRESHOLD = 50      # train PCA after this many samples
 
 # ---------- INIT ----------
 app = Flask(__name__)
-
-embed_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
 # SQLite
 def init_db():
@@ -49,6 +46,8 @@ db_conn = init_db()
 # PCA + Index state
 pca = None
 use_reduced = False
+embed_dim = 768   # Gemini embedding size
+
 if os.path.exists(META_PATH):
     with open(META_PATH, "r") as f:
         meta = json.load(f)
@@ -57,7 +56,7 @@ if os.path.exists(META_PATH):
 if use_reduced:
     index = faiss.IndexFlatIP(REDUCED_DIM)
 else:
-    index = faiss.IndexFlatIP(EMBED_DIM)
+    index = faiss.IndexFlatIP(embed_dim)
 
 # Load stored vectors if exist
 if os.path.exists(FAISS_INDEX_PATH):
@@ -83,7 +82,7 @@ def rebuild_with_pca():
     texts = get_all_texts()
     if not texts:
         return
-    X = embed_model.encode(texts, convert_to_numpy=True).astype("float32")
+    X = np.vstack([embed_text(t) for t in texts]).astype("float32")
     pca = PCA(n_components=REDUCED_DIM)
     X_reduced = pca.fit_transform(X)
     X_reduced = normalize(X_reduced)
@@ -94,7 +93,14 @@ def rebuild_with_pca():
     print("✅ PCA applied, index rebuilt.")
 
 def embed_text(text: str) -> np.ndarray:
-    v = embed_model.encode([text], convert_to_numpy=True).astype("float32")
+    url = f"{GEMINI_REST_BASE}/{GEMINI_EMBED_MODEL}:embedContent?key={GEMINI_API_KEY}"
+    headers = {"Content-Type": "application/json"}
+    payload = {"model": GEMINI_EMBED_MODEL, "content": {"parts": [{"text": text}]}}
+    resp = requests.post(url, headers=headers, json=payload)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Gemini embedding error: {resp.text}")
+    data = resp.json()
+    v = np.array(data["embedding"]["values"], dtype="float32").reshape(1, -1)
     if use_reduced and pca is not None:
         v = pca.transform(v)
     v = normalize(v)
@@ -103,11 +109,7 @@ def embed_text(text: str) -> np.ndarray:
 def query_gemini(prompt: str) -> str:
     url = f"{GEMINI_REST_BASE}/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
     headers = {"Content-Type": "application/json"}
-    payload = {
-        "contents": [
-            {"parts": [{"text": prompt}]}
-        ]
-    }
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
     resp = requests.post(url, headers=headers, json=payload)
     if resp.status_code != 200:
         return f"Error from Gemini: {resp.text}"
@@ -166,11 +168,11 @@ def chat():
         retrieved.append({"question": q, "answer": a})
 
     context = "\n".join([f"Q: {r['question']}\nA: {r['answer']}" for r in retrieved])
-    prompt = f"Answer the following user query using the provided context.\n\nContext:\n{context}\n\nUser Query: {query}"
+    prompt = f"Answer the following user query using the provided context.\n\nContext:\n{context}\n\nUser Query: {query}. Use your own knowledge if the context is insufficient."
 
     answer = query_gemini(prompt)
     return jsonify({"answer": answer, "retrieved": retrieved})
 
 # ---------- MAIN ----------
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=True, port=8000)
