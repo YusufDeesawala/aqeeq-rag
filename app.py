@@ -1,13 +1,14 @@
-# app.py
 import os
 import json
 import time
 import sqlite3
 import numpy as np
 import faiss
-import requests
+import torch
 from flask import Flask, request, jsonify
+from transformers import AutoTokenizer, AutoModel
 from sklearn.decomposition import PCA
+import requests
 
 # ---------- CONFIG ----------
 DATA_DIR = "data"
@@ -17,18 +18,17 @@ SQLITE_PATH = os.path.join(DATA_DIR, "qa_store.db")
 FAISS_INDEX_PATH = os.path.join(DATA_DIR, "faiss.index")
 META_PATH = os.path.join(DATA_DIR, "meta.json")
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-GEMINI_REST_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
-GEMINI_EMBED_MODEL = "embedding-001"
+REDUCED_DIM = 64
+PCA_THRESHOLD = 50
 
-REDUCED_DIM = 64        # target dim if PCA is used
-PCA_THRESHOLD = 50      # train PCA after this many samples
+# Groq Config
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 # ---------- INIT ----------
 app = Flask(__name__)
 
-# SQLite
 def init_db():
     conn = sqlite3.connect(SQLITE_PATH, check_same_thread=False)
     cur = conn.cursor()
@@ -43,26 +43,39 @@ def init_db():
 
 db_conn = init_db()
 
-# PCA + Index state
+# PCA and FAISS
 pca = None
 use_reduced = False
-embed_dim = 768   # Gemini embedding size
+embed_dim = 384
 
 if os.path.exists(META_PATH):
     with open(META_PATH, "r") as f:
         meta = json.load(f)
         use_reduced = meta.get("use_reduced", False)
 
-if use_reduced:
-    index = faiss.IndexFlatIP(REDUCED_DIM)
-else:
-    index = faiss.IndexFlatIP(embed_dim)
+index = faiss.IndexFlatIP(REDUCED_DIM if use_reduced else embed_dim)
 
-# Load stored vectors if exist
 if os.path.exists(FAISS_INDEX_PATH):
     index = faiss.read_index(FAISS_INDEX_PATH)
 
-# ---------- HELPERS ----------
+# ---------- MiniLM Embedding ----------
+tokenizer = AutoTokenizer.from_pretrained('sentence-transformers/all-MiniLM-L6-v2')
+model = AutoModel.from_pretrained('sentence-transformers/all-MiniLM-L6-v2')
+
+def embed_text(text: str) -> np.ndarray:
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True, max_length=512)
+    with torch.no_grad():
+        outputs = model(**inputs)
+        token_emb = outputs.last_hidden_state
+        attention_mask = inputs.attention_mask.unsqueeze(-1)
+        masked = token_emb * attention_mask
+        summed = masked.sum(dim=1)
+        counts = attention_mask.sum(dim=1)
+        mean_emb = summed / torch.clamp(counts, min=1e-9)
+        emb = mean_emb.squeeze().cpu().numpy()
+    return emb.astype("float32")
+
+# ---------- Helpers ----------
 def normalize(v: np.ndarray) -> np.ndarray:
     return v / (np.linalg.norm(v, axis=1, keepdims=True) + 1e-12)
 
@@ -92,52 +105,49 @@ def rebuild_with_pca():
     save_state()
     print("✅ PCA applied, index rebuilt.")
 
-def embed_text(text: str) -> np.ndarray:
-    url = f"{GEMINI_REST_BASE}/{GEMINI_EMBED_MODEL}:embedContent?key={GEMINI_API_KEY}"
-    headers = {"Content-Type": "application/json"}
-    payload = {"model": GEMINI_EMBED_MODEL, "content": {"parts": [{"text": text}]}}
-    resp = requests.post(url, headers=headers, json=payload)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Gemini embedding error: {resp.text}")
-    data = resp.json()
-    v = np.array(data["embedding"]["values"], dtype="float32").reshape(1, -1)
-    if use_reduced and pca is not None:
-        v = pca.transform(v)
-    v = normalize(v)
-    return v
+# ---------- Groq Completion ----------
+def query_groq(prompt: str) -> str:
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
 
-def query_gemini(prompt: str) -> str:
-    url = f"{GEMINI_REST_BASE}/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    headers = {"Content-Type": "application/json"}
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
-    resp = requests.post(url, headers=headers, json=payload)
-    if resp.status_code != 200:
-        return f"Error from Gemini: {resp.text}"
-    data = resp.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"]
+    data = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.7
+    }
 
-# ---------- ROUTES ----------
+    resp = requests.post(GROQ_API_URL, headers=headers, json=data)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Groq API error: {resp.text}")
+    response_data = resp.json()
+    return response_data["choices"][0]["message"]["content"]
+
+# ---------- Routes ----------
 @app.route("/add", methods=["POST"])
 def add():
     global use_reduced
     data = request.get_json()
-    q, a = data.get("question"), data.get("answer")
+    q = data.get("question")
+    a = data.get("answer")
     if not q or not a:
         return jsonify({"error": "need question and answer"}), 400
 
-    # Insert into DB
     cur = db_conn.cursor()
     cur.execute("INSERT INTO qa (question, answer, created_at) VALUES (?, ?, ?)",
                 (q, a, time.time()))
     db_conn.commit()
 
-    # Embedding
-    emb = embed_text(q)
+    emb = embed_text(q).reshape(1, -1)
     index.add(emb)
 
-    # Train PCA if threshold crossed
     cur.execute("SELECT COUNT(*) FROM qa")
     count = cur.fetchone()[0]
+
     if not use_reduced and count >= PCA_THRESHOLD:
         rebuild_with_pca()
 
@@ -152,7 +162,7 @@ def chat():
     if not query:
         return jsonify({"error": "need query"}), 400
 
-    emb = embed_text(query)
+    emb = embed_text(query).reshape(1, -1)
     D, I = index.search(emb, k)
 
     cur = db_conn.cursor()
@@ -168,11 +178,16 @@ def chat():
         retrieved.append({"question": q, "answer": a})
 
     context = "\n".join([f"Q: {r['question']}\nA: {r['answer']}" for r in retrieved])
-    prompt = f"Answer the following user query using the provided context.\n\nContext:\n{context}\n\nUser Query: {query}. Use your own knowledge if the context is insufficient."
 
-    answer = query_gemini(prompt)
+    prompt = (
+        "Use the following context to answer the user query.\n\n"
+        f"Context:\n{context}\n\n"
+        f"User Query: {query}\n\n"
+        "If the context is insufficient, answer using your own knowledge."
+    )
+
+    answer = query_groq(prompt)
     return jsonify({"answer": answer, "retrieved": retrieved})
 
-# ---------- MAIN ----------
 if __name__ == "__main__":
     app.run(debug=True, port=8000)

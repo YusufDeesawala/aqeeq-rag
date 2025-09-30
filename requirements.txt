@@ -5,3 +5,6 @@ requests
 python-dotenv
 gunicorn
 scikit-learn
+transformers
+sentence-transformers
+torch
